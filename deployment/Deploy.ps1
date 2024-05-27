@@ -198,6 +198,8 @@ if (!($ADApplicationID)) {
 		$ADObjectID = $ADApplication.id
         $ADApplicationID = $ADApplication.appId
         sleep 5 #this is to give time to AAD to register
+		# create service principal
+		az ad sp create --id $ADApplicationID
         $ADApplicationSecret = az ad app credential reset --id $ADObjectID --append --display-name 'SaaSAPI' --years 2 --query password --only-show-errors --output tsv
 				
         Write-Host "   🔵 FulfilmentAPI App Registration created."
@@ -316,6 +318,9 @@ Write-host "☁ Deploy Azure Resources"
 $WebAppNameService=$WebAppNamePrefix+"-asp"
 $WebAppNameAdmin=$WebAppNamePrefix+"-admin"
 $WebAppNamePortal=$WebAppNamePrefix+"-portal"
+$VnetName=$WebAppNamePrefix+"-vnet"
+$WebSubnetName="web"
+$DefaultSubnetName="default"
 
 #keep the space at the end of the string - bug in az cli running on windows powershell truncates last char https://github.com/Azure/azure-cli/issues/10066
 $ADApplicationSecretKeyVault="@Microsoft.KeyVault(VaultName=$KeyVault;SecretName=ADApplicationSecret) "
@@ -327,7 +332,12 @@ Write-host "   🔵 Resource Group"
 Write-host "      ➡️ Create Resource Group"
 az group create --location $Location --name $ResourceGroupForDeployment --output $azCliOutput
 
-Write-host "   🔵 SQL Server"
+Write-host "      ➡️ Create VNET and Subnet"
+az network vnet create --resource-group $ResourceGroupForDeployment --name $VnetName --address-prefixes "10.0.0.0/20" --output $azCliOutput
+az network vnet subnet create --resource-group $ResourceGroupForDeployment --vnet-name $VnetName -n $DefaultSubnetName --address-prefixes "10.0.0.0/24" --output $azCliOutput
+az network vnet subnet create --resource-group $ResourceGroupForDeployment --vnet-name $VnetName -n $WebSubnetName --address-prefixes "10.0.1.0/24" --service-endpoints Microsoft.Sql Microsoft.KeyVault --delegations Microsoft.Web/serverfarms  --output $azCliOutput 
+
+
 Write-host "      ➡️ Create Sql Server"
 $userId = az ad signed-in-user show --query id -o tsv 
 $userdisplayname = az ad signed-in-user show --query displayName -o tsv 
@@ -341,6 +351,7 @@ if ($env:ACC_CLOUD -eq $null){
 	$publicIp = (Invoke-WebRequest -uri "https://api.ipify.org").Content
     az sql server firewall-rule create --resource-group $ResourceGroupForDeployment --server $SQLServerName -n AllowIP --start-ip-address "$publicIp" --end-ip-address "$publicIp" --output $azCliOutput
 }
+
 Write-host "      ➡️ Create SQL DB"
 az sql db create --resource-group $ResourceGroupForDeployment --server $SQLServerName --name $SQLDatabaseName  --edition Standard  --capacity 10 --zone-redundant false --output $azCliOutput
 
@@ -350,6 +361,9 @@ az keyvault create --name $KeyVault --resource-group $ResourceGroupForDeployment
 Write-host "      ➡️ Add Secrets"
 az keyvault secret set --vault-name $KeyVault --name ADApplicationSecret --value="$ADApplicationSecret" --output $azCliOutput
 az keyvault secret set --vault-name $KeyVault --name DefaultConnection --value $Connection --output $azCliOutput
+Write-host "      ➡️ Update Firewall"
+az keyvault update --name $KeyVault --resource-group $ResourceGroupForDeployment --default-action Deny --output $azCliOutput
+az keyvault network-rule add --name $KeyVault --resource-group $ResourceGroupForDeployment --vnet-name $VnetName --subnet $WebSubnetName --output $azCliOutput
 
 Write-host "   🔵 App Service Plan"
 Write-host "      ➡️ Create App Service Plan"
@@ -393,7 +407,7 @@ $dbaccesstoken = (Get-AzAccessToken -ResourceUrl https://database.windows.net).T
 Invoke-Sqlcmd -InputFile ./script.sql -ServerInstance $ServerUri -database $SQLDatabaseName -AccessToken $dbaccesstoken
 
 Write-host "      ➡️ Execute SQL script to Add WebApps"
-$AddAppsIdsToDB = "CREATE USER [$WebAppNameAdmin] FROM EXTERNAL PROVIDER;ALTER ROLE db_datareader ADD MEMBER  [$WebAppNameAdmin];ALTER ROLE db_datawriter ADD MEMBER  [$WebAppNameAdmin];CREATE USER [$WebAppNamePortal] FROM EXTERNAL PROVIDER;ALTER ROLE db_datareader ADD MEMBER [$WebAppNamePortal];ALTER ROLE db_datawriter ADD MEMBER [$WebAppNamePortal];"
+$AddAppsIdsToDB = "CREATE USER [$WebAppNameAdmin] FROM EXTERNAL PROVIDER;ALTER ROLE db_datareader ADD MEMBER  [$WebAppNameAdmin];ALTER ROLE db_datawriter ADD MEMBER  [$WebAppNameAdmin]; GRANT EXEC TO [$WebAppNameAdmin]; CREATE USER [$WebAppNamePortal] FROM EXTERNAL PROVIDER;ALTER ROLE db_datareader ADD MEMBER [$WebAppNamePortal];ALTER ROLE db_datawriter ADD MEMBER [$WebAppNamePortal]; GRANT EXEC TO [$WebAppNamePortal];"
 Invoke-Sqlcmd -Query $AddAppsIdsToDB -ServerInstance $ServerUri -database $SQLDatabaseName -AccessToken $dbaccesstoken
 
 Write-host "   🔵 Deploy Code to Admin Portal"
@@ -401,6 +415,11 @@ az webapp deploy --resource-group $ResourceGroupForDeployment --name $WebAppName
 
 Write-host "   🔵 Deploy Code to Customer Portal"
 az webapp deploy --resource-group $ResourceGroupForDeployment --name $WebAppNamePortal --src-path "../Publish/CustomerSite.zip" --type zip --output $azCliOutput
+
+Write-host "   🔵 Update Firewall for WebApps and SQL"
+az webapp vnet-integration add --resource-group $ResourceGroupForDeployment --name $WebAppNamePortal --vnet $VnetName --subnet $WebSubnetName --output $azCliOutput
+az webapp vnet-integration add --resource-group $ResourceGroupForDeployment --name $WebAppNameAdmin --vnet $VnetName --subnet $WebSubnetName --output $azCliOutput
+az sql server vnet-rule create --name $WebAppNamePrefix-vnet --resource-group $ResourceGroupForDeployment --server $SQLServerName --vnet-name $VnetName --subnet $WebSubnetName --output $azCliOutput
 
 Write-host "   🔵 Clean up"
 Remove-Item -Path ../src/AdminSite/appsettings.Development.json
